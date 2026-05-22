@@ -7,12 +7,33 @@ The PM is the orchestrator. It receives assignments, produces a task plan, dispa
 1. **Planning** — calls Mistral to decompose an assignment into typed tasks with dependencies and agent assignments
 2. **Dispatching** — resolves the dependency graph; dispatches tasks whose dependencies are met
 3. **Tracking** — maintains `_active` dict of in-flight assignments; restores it from Valkey on restart
-4. **Retry logic** — on `task_failed`, re-dispatches the task (up to the retry limit in the plan)
+4. **Retry logic** — on `task_failed`, increments a PM-owned retry counter and re-dispatches up to `MAX_TASK_RETRIES`
 5. **Completion** — when all tasks complete, writes `status=completed` to the whiteboard
+
+## Retry cap
+
+```python
+MAX_TASK_RETRIES = int(os.getenv("MAX_TASK_RETRIES", "3"))
+```
+
+The PM tracks retries independently in `state["retries"][task_plan_id]` — **not** from the `retry_count` field in the incoming event payload. This prevents drift when multiple agents send conflicting counts.
+
+On each `task_failed` event:
+
+```python
+retries = state["retries"].get(task_plan_id, 0) + 1
+state["retries"][task_plan_id] = retries
+if retries >= MAX_TASK_RETRIES:
+    # mark task permanently failed, continue with remaining tasks
+else:
+    # re-dispatch with retry_count=retries in payload
+```
+
+The retry count is also persisted to the whiteboard as `task_{id}_retry_count` so it survives PM restarts.
 
 ## State recovery
 
-The PM's `_active` dict is in-memory but is restored from Valkey on startup by scanning all `whiteboard:*` keys with `status=in_progress`. This means PM container restarts are non-destructive — in-flight assignments resume from their last known state.
+The PM's `_active` dict is in-memory but is restored from Valkey on startup by scanning all `whiteboard:*` keys with `status=in_progress`. Retry counts are also restored.
 
 ```python
 async def _restore_active_assignments(self) -> None:
@@ -21,7 +42,7 @@ async def _restore_active_assignments(self) -> None:
         wb = await self.read_whiteboard(assignment_id)
         if wb.get("status") != "in_progress":
             continue
-        # Rebuild _active[assignment_id] from plan + task statuses
+        # Rebuild _active[assignment_id] from plan + task statuses + retry counts
 ```
 
 ## Task plan schema
@@ -56,11 +77,10 @@ async def _restore_active_assignments(self) -> None:
 }
 ```
 
+## Deployment targets
+
+The PM always plans for **Docker image builds** as the deployment step — never Vercel. The default fallback deployment task is `build_1` (Docker build, assigned to infra).
+
 ## Workflow poller
 
 The PM also runs a background poller that checks GitHub Actions workflow runs for repos in the org and can react to CI failures. Repos can be excluded via `_EXCLUDED_REPOS` in `agents/project_manager/agent.py`.
-
-## Known limitations
-
-- Single PM is a bottleneck for high assignment throughput (acceptable at current scale)
-- No hard retry cap is enforced at the PM level — if QA repeatedly fails, the PM will keep re-dispatching
