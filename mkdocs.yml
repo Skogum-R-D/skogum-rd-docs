@@ -71,6 +71,7 @@ nav:
   - Tools:
     - GitHub Tools: tools/github-tools.md
     - Build & Test: tools/build-and-test.md
+    - Next.js Starter: tools/nextjs-starter.md
   - Dashboard: dashboard.md
   - Observability: observability.md
   - Operations: operations.md
